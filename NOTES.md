@@ -1,0 +1,1 @@
+Implementation note: the first host-side build is the only manual bootstrap step. After activation, future `cargo fmt`, `cargo clippy`, `cargo test`, release builds, and diagnostics for this MCP can be performed through `workspace_execute` itself.

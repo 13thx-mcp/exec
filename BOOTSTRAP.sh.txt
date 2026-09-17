@@ -1,0 +1,7 @@
+cd /Users/xiivth/workspaces/signs/mcp-server/exec
+cargo fmt --all
+cargo build --release
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo build --release --locked
