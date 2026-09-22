@@ -7,14 +7,17 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use rmcp::{
-    ErrorData as McpError, ServiceExt,
+    ErrorData as McpError, RoleServer, ServiceExt,
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock},
-    schemars, tool, tool_router,
+    schemars,
+    service::RequestContext,
+    tool, tool_router,
     transport::stdio,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{io::AsyncWriteExt, process::Command};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_MAX_TIMEOUT_MS: u64 = 300_000;
@@ -224,6 +227,16 @@ struct CommandSpec {
     args: Vec<String>,
 }
 
+struct ProcessInvocation<'a> {
+    program: &'a str,
+    args: &'a [String],
+    cwd: &'a Path,
+    timeout_ms: u64,
+    stdin: Option<&'a str>,
+    env: &'a BTreeMap<String, String>,
+    cancellation: Option<&'a CancellationToken>,
+}
+
 #[derive(Debug, Serialize)]
 struct QualityOutput {
     cwd: String,
@@ -384,7 +397,11 @@ impl ExecServer {
         "npm".to_owned()
     }
 
-    async fn execute(&self, args: &ExecuteArgs) -> std::result::Result<ExecutionOutput, String> {
+    async fn execute(
+        &self,
+        args: &ExecuteArgs,
+        cancellation: Option<&CancellationToken>,
+    ) -> std::result::Result<ExecutionOutput, String> {
         if args.args.len() > MAX_ARGS {
             return Err(format!("too many arguments; maximum is {MAX_ARGS}"));
         }
@@ -403,26 +420,31 @@ impl ExecServer {
         let cwd = self.resolve_cwd(args.cwd.as_deref())?;
         let program = self.validate_program(&args.program, &cwd)?;
         let timeout_ms = self.validated_timeout(args.timeout_ms)?;
-        self.run_process(
-            &program,
-            &args.args,
-            &cwd,
+        self.run_process(ProcessInvocation {
+            program: &program,
+            args: &args.args,
+            cwd: &cwd,
             timeout_ms,
-            args.stdin.as_deref(),
-            &args.env,
-        )
+            stdin: args.stdin.as_deref(),
+            env: &args.env,
+            cancellation,
+        })
         .await
     }
 
     async fn run_process(
         &self,
-        program: &str,
-        args: &[String],
-        cwd: &Path,
-        timeout_ms: u64,
-        stdin: Option<&str>,
-        env: &BTreeMap<String, String>,
+        invocation: ProcessInvocation<'_>,
     ) -> std::result::Result<ExecutionOutput, String> {
+        let ProcessInvocation {
+            program,
+            args,
+            cwd,
+            timeout_ms,
+            stdin,
+            env,
+            cancellation,
+        } = invocation;
         let mut command = Command::new(program);
         command
             .args(args)
@@ -454,7 +476,12 @@ impl ExecServer {
             command.stdin(std::process::Stdio::piped());
         }
 
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err("process execution cancelled by MCP client before spawn".to_owned());
+        }
+
         let started = Instant::now();
+        let mut deadline = Box::pin(tokio::time::sleep(Duration::from_millis(timeout_ms)));
         let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start `{program}`: {error}"))?;
@@ -462,17 +489,42 @@ impl ExecServer {
         if let Some(input) = stdin
             && let Some(mut child_stdin) = child.stdin.take()
         {
-            child_stdin
-                .write_all(input.as_bytes())
-                .await
-                .map_err(|error| format!("failed to write child stdin: {error}"))?;
+            let write_result = tokio::select! {
+                biased;
+                result = child_stdin.write_all(input.as_bytes()) => Some(result),
+                _ = request_cancelled(cancellation) => {
+                    return Err("process execution cancelled by MCP client while writing stdin".to_owned());
+                }
+                _ = &mut deadline => None,
+            };
+            match write_result {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    return Err(format!("failed to write child stdin: {error}"));
+                }
+                None => {
+                    return Ok(self.timeout_output(
+                        program,
+                        args,
+                        cwd,
+                        timeout_ms,
+                        started.elapsed(),
+                    ));
+                }
+            }
         }
 
-        let waited = timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await;
+        let mut wait = Box::pin(child.wait_with_output());
+        let waited = tokio::select! {
+            biased;
+            result = &mut wait => ProcessWait::Completed(result),
+            _ = request_cancelled(cancellation) => ProcessWait::Cancelled,
+            _ = &mut deadline => ProcessWait::TimedOut,
+        };
         let duration_ms = started.elapsed().as_millis();
 
         match waited {
-            Ok(result) => {
+            ProcessWait::Completed(result) => {
                 let output = result
                     .map_err(|error| format!("failed while waiting for `{program}`: {error}"))?;
                 let (stdout, stdout_truncated) = bounded_utf8(output.stdout, self.max_output_bytes);
@@ -494,30 +546,44 @@ impl ExecServer {
                     diagnostics,
                 })
             }
-            Err(_) => {
-                let message = format!(
-                    "process exceeded timeout of {timeout_ms} ms; the direct child was terminated"
-                );
-                Ok(ExecutionOutput {
-                    program: program.to_owned(),
-                    args: args.to_vec(),
-                    cwd: self.relative_display(cwd),
-                    exit_code: None,
-                    success: false,
-                    timed_out: true,
-                    duration_ms,
-                    stdout: String::new(),
-                    stderr: message.clone(),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                    diagnostics: DiagnosticSummary {
-                        error_lines: 1,
-                        warning_lines: 0,
-                        failure_lines: 1,
-                        highlights: vec![message],
-                    },
-                })
+            ProcessWait::TimedOut => {
+                Ok(self.timeout_output(program, args, cwd, timeout_ms, started.elapsed()))
             }
+            ProcessWait::Cancelled => Err(
+                "process execution cancelled by MCP client; the direct child was terminated"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    fn timeout_output(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        timeout_ms: u64,
+        duration: Duration,
+    ) -> ExecutionOutput {
+        let message =
+            format!("process exceeded timeout of {timeout_ms} ms; the direct child was terminated");
+        ExecutionOutput {
+            program: program.to_owned(),
+            args: args.to_vec(),
+            cwd: self.relative_display(cwd),
+            exit_code: None,
+            success: false,
+            timed_out: true,
+            duration_ms: duration.as_millis(),
+            stdout: String::new(),
+            stderr: message.clone(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            diagnostics: DiagnosticSummary {
+                error_lines: 1,
+                warning_lines: 0,
+                failure_lines: 1,
+                highlights: vec![message],
+            },
         }
     }
 
@@ -587,6 +653,7 @@ impl ExecServer {
     async fn quality_check(
         &self,
         args: &QualityArgs,
+        cancellation: Option<&CancellationToken>,
     ) -> std::result::Result<QualityOutput, String> {
         let detection = self.detect_project(&args.cwd)?;
         if detection.kinds.is_empty() {
@@ -612,15 +679,17 @@ impl ExecServer {
 
         for spec in plan {
             let program = self.validate_program(&spec.program, &cwd)?;
+            let empty_env = BTreeMap::new();
             let result = self
-                .run_process(
-                    &program,
-                    &spec.args,
-                    &cwd,
+                .run_process(ProcessInvocation {
+                    program: &program,
+                    args: &spec.args,
+                    cwd: &cwd,
                     timeout_ms,
-                    None,
-                    &BTreeMap::new(),
-                )
+                    stdin: None,
+                    env: &empty_env,
+                    cancellation,
+                })
                 .await?;
             merge_diagnostics(&mut aggregate, &result.diagnostics);
             let failed = !result.success;
@@ -658,8 +727,9 @@ impl ExecServer {
     async fn workspace_execute(
         &self,
         Parameters(args): Parameters<ExecuteArgs>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        Ok(match self.execute(&args).await {
+        Ok(match self.execute(&args, Some(&context.ct)).await {
             Ok(output) => self.success_json(&output),
             Err(error) => Self::failure(error),
         })
@@ -684,11 +754,26 @@ impl ExecServer {
     async fn workspace_quality_check(
         &self,
         Parameters(args): Parameters<QualityArgs>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        Ok(match self.quality_check(&args).await {
+        Ok(match self.quality_check(&args, Some(&context.ct)).await {
             Ok(output) => self.success_json(&output),
             Err(error) => Self::failure(error),
         })
+    }
+}
+
+enum ProcessWait {
+    Completed(std::io::Result<std::process::Output>),
+    TimedOut,
+    Cancelled,
+}
+
+async fn request_cancelled(cancellation: Option<&CancellationToken>) {
+    if let Some(cancellation) = cancellation {
+        cancellation.cancelled().await;
+    } else {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -1114,6 +1199,48 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_terminates_running_process_promptly() {
+        let workspace_root = std::fs::canonicalize(".").unwrap();
+        let server = ExecServer {
+            workspace_root: workspace_root.clone(),
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            max_timeout_ms: DEFAULT_MAX_TIMEOUT_MS,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        };
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let args = vec!["5".to_owned()];
+        let env = BTreeMap::new();
+        let started = Instant::now();
+        let result = server
+            .run_process(ProcessInvocation {
+                program: "/bin/sleep",
+                args: &args,
+                cwd: &workspace_root,
+                timeout_ms: 5_000,
+                stdin: None,
+                env: &env,
+                cancellation: Some(&cancellation),
+            })
+            .await;
+
+        assert!(
+            result
+                .expect_err("cancelled process should return an error")
+                .contains("cancelled")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation should not wait for the child process timeout"
+        );
+    }
 
     #[test]
     fn path_validation_blocks_escape() {
